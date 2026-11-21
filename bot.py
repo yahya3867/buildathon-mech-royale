@@ -8,6 +8,10 @@ import mechfight as mf
 CELL = 6
 DIRECTIONS = [(x, y) for x in (-1, 0, 1) for y in (-1, 0, 1) if x or y]
 
+# Upgrade order adapted from giddygiddyboy under MIT (see THIRD_PARTY_LICENSE.txt).
+UPGRADES = "plating armor gun_damage nanites gun_rate lightning_efficiency lightning_range laser_damage servos laser_charge gun_mag gun_velocity gyros lightning_chain reactor capacitor mortar_reload mortar_splash mortar_velocity sensors jets laser_pierce".split()
+LASER_UPGRADES = "plating armor laser_damage laser_charge nanites gun_damage gun_rate lightning_efficiency lightning_range servos gun_mag gun_velocity gyros lightning_chain reactor capacitor mortar_reload mortar_splash mortar_velocity sensors jets laser_pierce".split()
+
 def cell(x, y):
     return (math.floor(x / CELL), math.floor(y / CELL))
 
@@ -45,6 +49,16 @@ class Bot:
                             if any(inside(i*CELL+dx, j*CELL+dy, ring) for dx,dy in ((3,3),(1,1),(1,5),(5,1),(5,5))):
                                 self.blocked.add((i,j))
                 break
+        self.shelters = set()
+        for i, j in self.blocked:
+            for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                candidate = (i+dx, j+dy)
+                if candidate not in self.blocked:
+                    self.shelters.add(candidate)
+        self.home = None
+        self.home_until = -1
+        self.last_seen = None
+        self.last_seen_at = -100
         self.side = 1 if hello["slot"] % 2 else -1
 
     def route_to(self, start, end):
@@ -75,6 +89,34 @@ class Bot:
             nearest = previous[nearest]
         return route
 
+    def shelter(self, pos, zone, now):
+        if self.home and now < self.home_until:
+            return self.home
+        center = zone["next_center"]
+        margin = min(16, zone["next_radius"] * 0.25)
+        radius = max(1, zone["next_radius"] - margin)
+        best, goal = float("inf"), center
+        for i,j in self.shelters:
+            point = ((i+0.5)*CELL,(j+0.5)*CELL)
+            if distance(point,center)>radius or distance(point,zone["center"])>zone["radius"]-margin:
+                continue
+            cost = distance(pos,point) + 0.10*distance(center,point)
+            if self.last_seen and now-self.last_seen_at < 8:
+                threat = self.last_seen
+                d = max(1,distance(point,threat))
+                cost += max(0,100-d)
+                # Prefer reachable cells with a building between the two game actors.
+                for step in (6,12,18):
+                    sample = (point[0]+(threat[0]-point[0])*step/d,
+                              point[1]+(threat[1]-point[1])*step/d)
+                    if cell(*sample) in self.blocked:
+                        cost -= 55
+                        break
+            if cost < best:
+                best,goal=cost,point
+        self.home,self.home_until=goal,now+2.0
+        return goal
+
     def act(self, obs):
         me, zone = obs["self"], obs["zone"]
         x,y,z = me["pos"]
@@ -82,6 +124,10 @@ class Bot:
         def nearest(items):
             return min(items, key=lambda p: distance(pos,p["pos"]), default=None)
         enemy = nearest([m for m in obs["mechs"] if m["kind"] == "mech"])
+        now=obs["t"]
+        if enemy:
+            self.last_seen,self.last_seen_at=enemy["pos"][:2],now
+        recovering=me["hp"] < 0.70*me["max_hp"]
         target = enemy or nearest(obs["crates"]) or nearest(obs["mechs"])
         loot = nearest([p for p in obs["pickups"] if p["kind"] in ("laser","lightning")])
         cube = nearest(obs["cubes"])
@@ -102,7 +148,12 @@ class Bot:
             drop=nearest(obs["drops"])
             if distance(pos,drop["pos"])<100:
                 goal=drop["pos"]
-        if distance(pos,zone["center"]) > zone["radius"]-12:
+        holding = recovering or (me["weapons"][1] is not None and not cube and not danger)
+        if holding:
+            goal = self.shelter(pos,zone,now)
+        travel_time = max(0,distance(pos,center)-zone["next_radius"]+10)/max(1,me["stats"]["walk_speed"])
+        evacuate = travel_time>0 and now+1.6*travel_time+2 >= zone["shrink_end"]
+        if evacuate or distance(pos,zone["center"]) > zone["radius"]-min(12,zone["radius"]*0.2):
             goal=center
         dest=cell(*goal[:2])
         if obs["tick"]-self.last_plan>=12 and (not self.route or dest!=self.destination):
@@ -113,12 +164,16 @@ class Bot:
         waypoint=self.route[-1] if self.route else goal
         yaw=math.atan2(waypoint[1]-y,waypoint[0]-x)
         act={"move":[math.cos(yaw),math.sin(yaw)],"aim":[yaw,0],"boost":bool(danger or not me["in_zone"]),"jump":obs["tick"]%30==0}
+        if holding and distance(pos,goal)<4:
+            act.update(move=[0,0],boost=False,jump=False)
+        elif not me["in_zone"] or evacuate:
+            act.update(boost=me["energy"]>0.2*me["max_energy"],jump=False)
         if loot and distance(pos,loot["pos"]) < self.reach and not me["weapons"][1]:
             act["take"]=loot["id"]
         if obs["offer"]:
-            priorities=["armor","regen","speed","gun_damage","gun_rate"]
+            priorities=LASER_UPGRADES if any(w and w["kind"]=="laser" for w in me["weapons"]) else UPGRADES
             act["pick"]=min(range(len(obs["offer"]["choices"])),key=lambda i: priorities.index(k) if (k:=obs["offer"]["choices"][i]["id"]) in priorities else 99)
-        if target:
+        if target and (not recovering or (enemy and distance(pos,enemy["pos"])<65)):
             tx,ty,tz=target["pos"]
             d=distance(pos,(tx,ty))
             secondary=me["weapons"][1]
